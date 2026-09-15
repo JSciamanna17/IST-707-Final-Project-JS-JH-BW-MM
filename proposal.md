@@ -2,15 +2,15 @@
 
 ## Team
 
-### Marcus
+### Marcus Mann
 Email: mmann01@syr.edu  
 GitHub ID: marcusmann19
 
-### Jordan
+### Jordan Hemley
 Email: jghemley@syr.edu  
 GitHub ID: Jemley23
 
-### Brady
+### Brady White
 Email: 
 
 GitHub ID:
