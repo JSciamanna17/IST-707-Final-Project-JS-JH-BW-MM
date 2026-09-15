@@ -11,7 +11,9 @@ Email: jghemley@syr.edu
 GitHub ID: Jemley23
 
 ### Brady
-GitHub ID: [ADD GITHUB ID]
+Email: 
+
+GitHub ID:
 
 ### Jake Sciamanna (Point of Contact)
 Email: jpsciama@syr.edu  
