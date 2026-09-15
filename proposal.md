@@ -11,7 +11,7 @@ Email: jghemley@syr.edu
 GitHub ID: Jemley23
 
 ### Brady White
-Email: 
+Email: bwhite11@syr.edu
 
 GitHub ID:
 
