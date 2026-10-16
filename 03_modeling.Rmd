@@ -1,0 +1,374 @@
+---
+title: "Predicting NFL Career Success from Combine Results"
+subtitle: "IST 707 Final Project — Clustering and Supervised Modeling"
+author: ""
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 5)
+```
+
+```{r packages}
+# install.packages(c("dplyr", "tidyr", "readr", "ggplot2", "cluster", "ranger", "pROC", "knitr"))
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+library(cluster)   # silhouette
+library(ranger)    # fast random forest
+library(pROC)      # AUC / ROC curves
+library(knitr)     # kable tables
+
+set.seed(707)
+```
+
+# Overview
+
+This analysis uses NFL Combine results merged with draft and career data (from `02_merge_data.R`) to answer two questions:
+
+1. **Are there distinct athletic archetypes among Combine participants, and do they differ in career outcomes?** (unsupervised — k-means clustering)
+2. **Can Combine results predict which players become multi-year NFL starters?** (supervised — logistic regression and random forest)
+
+# Data Preparation
+
+```{r load}
+nfl <- read_csv("nfl_combine_career_data.csv", na = c("NA", ""), show_col_types = FALSE)
+dim(nfl)
+```
+
+## Cleaning decisions
+
+- **Height** is stored as text ("6-4") and is converted to inches.
+- **Positions** are collapsed from ~25 labels into 9 groups. Kickers, punters, and long snappers are dropped because Combine drills are not relevant to them.
+- **Only 2000–2019 draft classes** are kept. Players from 2020 onward have not had enough seasons for "success" to be known.
+- **Undrafted players** do not appear in the draft table, so their career stats are set to 0. This is a limitation: some undrafted free agents did have NFL careers.
+
+```{r clean}
+ht_to_in <- function(h) {
+  parts <- strsplit(as.character(h), "-")
+  sapply(parts, function(p) if (length(p) == 2) as.numeric(p[1]) * 12 + as.numeric(p[2]) else NA_real_)
+}
+
+pos_groups <- c(
+  QB = "QB", RB = "RB", FB = "RB", WR = "WR", TE = "TE",
+  OT = "OL", OG = "OL", G = "OL", C = "OL", OL = "OL",
+  DT = "DL", DL = "DL", DE = "EDGE", EDGE = "EDGE",
+  OLB = "LB", ILB = "LB", LB = "LB",
+  CB = "DB", S = "DB", SAF = "DB", DB = "DB"
+)
+
+drills <- c("ht_in", "wt", "forty", "bench", "vertical", "broad_jump", "cone", "shuttle")
+
+nfl_clean <- nfl %>%
+  mutate(
+    ht_in     = ht_to_in(ht),
+    across(c(wt, forty, bench, vertical, broad_jump, cone, shuttle,
+             round, pick, w_av, games, seasons_started, probowls), as.numeric),
+    pos_group = unname(pos_groups[pos])
+  ) %>%
+  filter(!is.na(pos_group)) %>%
+  filter(season.x >= 2000, season.x <= 2019) %>%
+  mutate(
+    drafted = as.integer(!is.na(round)),
+    across(c(w_av, games, seasons_started, probowls), ~ replace_na(.x, 0)),
+    success = factor(ifelse(seasons_started >= 3, "yes", "no"), levels = c("no", "yes"))
+  )
+
+nrow(nfl_clean)
+```
+
+## Defining success
+
+The target variable is **success = became a starter for 3 or more seasons**.
+
+```{r target}
+nfl_clean %>%
+  count(success) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  kable(caption = "Overall success rate")
+
+nfl_clean %>%
+  group_by(pos_group) %>%
+  summarise(n = n(), pct_starter = round(mean(success == "yes") * 100, 1)) %>%
+  arrange(desc(pct_starter)) %>%
+  kable(caption = "Success rate by position group")
+```
+
+## Position-adjusted drill scores
+
+A 4.6-second 40-yard dash is elite for a defensive tackle and slow for a cornerback. To compare players fairly, every drill is converted to a **z-score within the player's position group**.
+
+```{r zscores}
+nfl_clean <- nfl_clean %>%
+  group_by(pos_group) %>%
+  mutate(across(all_of(drills),
+                ~ (.x - mean(.x, na.rm = TRUE)) / sd(.x, na.rm = TRUE),
+                .names = "{.col}_z")) %>%
+  ungroup()
+```
+
+## Missing drill results
+
+Many players skip some drills, so missingness is substantial for bench, cone, and shuttle.
+
+```{r missing}
+nfl_clean %>%
+  summarise(across(all_of(drills), ~ round(mean(is.na(.x)) * 100, 1))) %>%
+  pivot_longer(everything(), names_to = "drill", values_to = "pct_missing") %>%
+  kable(caption = "Percent missing by drill")
+```
+
+Each missing value is flagged with an indicator (skipping a drill can itself be a signal), then filled with z = 0, the average for that player's position. Timed drills are sign-flipped so that **higher always means better** in the cluster profiles.
+
+```{r impute}
+z_cols <- paste0(drills, "_z")
+
+nfl_clean <- nfl_clean %>%
+  mutate(across(all_of(drills), ~ as.integer(is.na(.x)), .names = "{.col}_miss")) %>%
+  mutate(across(all_of(z_cols), ~ replace_na(.x, 0))) %>%
+  mutate(speed_z    = -forty_z,
+         cone_zr    = -cone_z,
+         shuttle_zr = -shuttle_z)
+```
+
+# Clustering: Athletic Archetypes
+
+K-means clustering groups players by their position-adjusted athletic profile.
+
+```{r clust-data}
+clust_vars <- c("speed_z", "vertical_z", "broad_jump_z", "bench_z",
+                "wt_z", "cone_zr", "shuttle_zr")
+clust_data <- nfl_clean %>% select(all_of(clust_vars))
+```
+
+## Choosing the number of clusters
+
+```{r choose-k}
+k_range <- 2:8
+wss <- sapply(k_range, function(k) kmeans(clust_data, k, nstart = 25)$tot.withinss)
+
+sil_sample <- sample(nrow(clust_data), 3000)
+d_sample   <- dist(clust_data[sil_sample, ])
+sil <- sapply(k_range, function(k) {
+  km <- kmeans(clust_data, k, nstart = 25)
+  mean(silhouette(km$cluster[sil_sample], d_sample)[, 3])
+})
+
+k_eval <- data.frame(k = k_range, wss = round(wss), silhouette = round(sil, 3))
+kable(k_eval, caption = "Elbow and silhouette by k")
+
+ggplot(k_eval, aes(k, wss)) + geom_line() + geom_point() +
+  labs(title = "Elbow plot", y = "Total within-cluster sum of squares") +
+  theme_minimal()
+```
+
+k = 4 gave the best silhouette in testing (about 0.15). A low silhouette is expected here: athleticism is a continuum rather than a set of sharply separated groups, so the clusters are best read as **interpretable profiles**.
+
+## Cluster profiles
+
+```{r kmeans}
+km <- kmeans(clust_data, centers = 4, nstart = 50)
+nfl_clean$cluster <- factor(km$cluster)
+
+cluster_profile <- nfl_clean %>%
+  group_by(cluster) %>%
+  summarise(
+    n            = n(),
+    speed        = mean(speed_z),
+    vertical     = mean(vertical_z),
+    broad        = mean(broad_jump_z),
+    bench        = mean(bench_z),
+    weight       = mean(wt_z),
+    pct_drafted  = mean(drafted) * 100,
+    avg_pick     = mean(pick, na.rm = TRUE),
+    pct_starter  = mean(success == "yes") * 100,
+    avg_w_av     = mean(w_av),
+    pct_probowl  = mean(probowls > 0) * 100
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+
+kable(cluster_profile, caption = "Athletic profile and career outcomes by cluster")
+```
+
+**Interpretation.** Cluster numbers change between runs, so match clusters by their profile. In testing they came out roughly as:
+
+| Archetype | Profile | Starter rate |
+|---|---|---|
+| Explosive athletes | Fast, big jumps | ~40% |
+| Big & strong | Heavy for position, strong bench | ~32% |
+| Undersized / average | Light, slightly below average | ~27% |
+| Below-average movers | Slow, poor jumps | ~18% |
+
+## Is cluster related to success?
+
+```{r chisq}
+chisq.test(table(nfl_clean$cluster, nfl_clean$success))
+```
+
+## Visualizing the clusters
+
+```{r pca}
+pca <- prcomp(clust_data)
+summary(pca)$importance[, 1:3]
+
+pca_df <- data.frame(pca$x[, 1:2], cluster = nfl_clean$cluster)
+ggplot(pca_df, aes(PC1, PC2, color = cluster)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  labs(title = "Athletic archetypes (k-means, PCA projection)") +
+  theme_minimal()
+```
+
+```{r cluster-by-pos, fig.height=5.5}
+nfl_clean %>%
+  group_by(pos_group, cluster) %>%
+  summarise(n = n(), pct_starter = mean(success == "yes") * 100, .groups = "drop") %>%
+  ggplot(aes(pos_group, pct_starter, fill = cluster)) +
+  geom_col(position = "dodge") +
+  labs(title = "Starter rate by athletic archetype and position",
+       y = "% who became 3+ year starters", x = NULL) +
+  theme_minimal()
+```
+
+# Supervised Models: Predicting Multi-Year Starters
+
+## Train/test split
+
+The models train on **2000–2015** draft classes and are tested on **2016–2019**. This time-based split mimics real use (predicting a new class from past ones) and avoids leakage between years.
+
+Two feature sets are compared:
+
+- **Combine only**: position-adjusted drill z-scores, missing-drill flags, position group
+- **Combine + draft pick**: adds where the player was drafted (undrafted = pick 300), measuring how much NFL teams already know beyond the Combine
+
+```{r split}
+miss_cols <- paste0(drills, "_miss")
+combine_feats <- c(z_cols, miss_cols, "pos_group")
+
+model_df <- nfl_clean %>%
+  mutate(pos_group = factor(pos_group),
+         pick_filled = ifelse(is.na(pick), 300, pick))
+
+train <- model_df %>% filter(season.x <= 2015)
+test  <- model_df %>% filter(season.x >= 2016)
+
+c(train = nrow(train), test = nrow(test))
+
+f_combine <- as.formula(paste("success ~", paste(combine_feats, collapse = " + ")))
+f_full    <- update(f_combine, . ~ . + pick_filled)
+
+auc_of <- function(probs) as.numeric(auc(roc(test$success, probs, quiet = TRUE)))
+```
+
+## Model fitting
+
+```{r models}
+# Logistic regression
+logit_A <- glm(f_combine, data = train, family = binomial)
+logit_B <- glm(f_full,    data = train, family = binomial)
+p_logit_A <- predict(logit_A, test, type = "response")
+p_logit_B <- predict(logit_B, test, type = "response")
+
+# Random forest
+rf_A <- ranger(f_combine, data = train, num.trees = 500, min.node.size = 10,
+               probability = TRUE, importance = "permutation")
+rf_B <- ranger(f_full, data = train, num.trees = 500, min.node.size = 10,
+               probability = TRUE, importance = "permutation")
+p_rf_A <- predict(rf_A, test)$predictions[, "yes"]
+p_rf_B <- predict(rf_B, test)$predictions[, "yes"]
+```
+
+## Results
+
+```{r results}
+results <- data.frame(
+  model = c("Logistic — combine only", "Random forest — combine only",
+            "Logistic — combine + pick", "Random forest — combine + pick"),
+  test_AUC = round(c(auc_of(p_logit_A), auc_of(p_rf_A),
+                     auc_of(p_logit_B), auc_of(p_rf_B)), 3)
+)
+kable(results, caption = "Test-set AUC (2016–2019 classes)")
+```
+
+In the prototype, combine-only models reached an AUC of about **0.69** and adding draft pick raised it to about **0.88**. The Combine carries real but modest signal; most of what predicts a career is already reflected in where teams draft a player.
+
+```{r roc}
+plot(roc(test$success, p_rf_A, quiet = TRUE), col = "steelblue",
+     main = "ROC: who becomes a 3+ year starter")
+plot(roc(test$success, p_rf_B, quiet = TRUE), col = "darkred", add = TRUE)
+legend("bottomright", c("Combine only", "Combine + draft pick"),
+       col = c("steelblue", "darkred"), lwd = 2)
+```
+
+## Confusion matrix
+
+Because only about 29% of players become multi-year starters, a cutoff of 0.3 is used instead of 0.5.
+
+```{r confusion}
+cutoff <- 0.3
+cm <- table(predicted = ifelse(p_rf_A > cutoff, "yes", "no"), actual = test$success)
+cm
+cat("Accuracy:", round(sum(diag(cm)) / sum(cm), 3), "\n")
+```
+
+## Logistic regression coefficients
+
+```{r logit-coef}
+coef_tbl <- summary(logit_A)$coefficients
+kable(round(coef_tbl[order(coef_tbl[, 4]), ][1:12, ], 4),
+      caption = "Most significant predictors (combine-only logistic model)")
+```
+
+## Feature importance
+
+```{r importance}
+imp <- sort(rf_A$variable.importance, decreasing = TRUE)
+data.frame(feature = names(imp), importance = imp) %>%
+  head(12) %>%
+  ggplot(aes(reorder(feature, importance), importance)) +
+  geom_col(fill = "steelblue") + coord_flip() +
+  labs(title = "Random forest feature importance (combine only)", x = NULL) +
+  theme_minimal()
+```
+
+In testing, position-adjusted 40-yard dash and weight were the strongest signals.
+
+# Extension: Predicting Career Value
+
+As a continuous outcome, a random forest predicts weighted career Approximate Value (`w_av`) for drafted players only.
+
+```{r wav}
+drafted_train <- train %>% filter(drafted == 1)
+drafted_test  <- test  %>% filter(drafted == 1)
+
+f_wav <- as.formula(paste("w_av ~", paste(combine_feats, collapse = " + ")))
+rf_wav <- ranger(f_wav, data = drafted_train, num.trees = 500, min.node.size = 10)
+pred_wav <- predict(rf_wav, drafted_test)$predictions
+
+data.frame(
+  RMSE = round(sqrt(mean((pred_wav - drafted_test$w_av)^2)), 2),
+  R2   = round(cor(pred_wav, drafted_test$w_av)^2, 3)
+) %>% kable(caption = "Career value regression (test set)")
+```
+
+Note: 2016–2019 players are still accumulating career value, so this R² understates the model's true skill.
+
+# Conclusions
+
+- **Athletic archetypes exist and relate to outcomes.** Explosive players became multi-year starters at roughly twice the rate of slow, poor-jumping players.
+- **Combine results alone predict career success modestly** (AUC ≈ 0.69).
+- **Draft position adds far more** (AUC ≈ 0.88), suggesting teams already incorporate most Combine information plus film and scouting that the Combine does not capture.
+
+## Limitations
+
+- Undrafted players are assigned zero career value, which undercounts successful undrafted free agents.
+- Drill missingness is high for bench, cone, and shuttle; mean imputation within position may blur differences.
+- "3+ seasons as a starter" is one definition of success; results could differ for Pro Bowls or career length.
